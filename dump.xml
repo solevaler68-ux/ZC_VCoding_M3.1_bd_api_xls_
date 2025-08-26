@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<data>
+	<header>
+		<column name="id" type="int4" />
+		<column name="full_name" type="text" />
+		<column name="summ" type="float4" />
+		<column name="card_number" type="int4" />
+		<column name="birthday" type="date" />
+	</header>
+	<records>
+		<row>
+			<column name="id">0</column>
+			<column name="full_name">Иванов Иван Иванович</column>
+			<column name="summ">1000</column>
+			<column name="card_number">0</column>
+			<column name="birthday">2001-01-01</column>
+		</row>
+	</records>
+</data>
