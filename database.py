@@ -127,3 +127,21 @@ class Database:
         except psycopg2.Error as e:
             logger.error(f"Ошибка при получении пользователей: {e}")
             return []
+
+    def get_next_card_number(self) -> int:
+        """
+        Получение следующего номера карты (максимальный существующий + 1)
+        Если таблица пуста, возвращает 1
+
+        Returns:
+            Следующий уникальный номер карты
+        """
+        try:
+            with self.connect() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT COALESCE(MAX(card_number), 0) FROM users")
+                    max_card_number = cursor.fetchone()[0]
+                    return max_card_number + 1
+        except psycopg2.Error as e:
+            logger.error(f"Ошибка при получении следующего номера карты: {e}")
+            return 1

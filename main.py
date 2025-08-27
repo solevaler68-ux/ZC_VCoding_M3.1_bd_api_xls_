@@ -1,8 +1,11 @@
 import os
 import logging
+import re
+from datetime import datetime
 from dotenv import load_dotenv
 import telebot
 from telebot import types
+from telebot.handler_backends import State, StatesGroup
 from database import Database
 
 # Загрузка переменных окружения
@@ -21,6 +24,12 @@ if not bot_token:
     raise ValueError("BOT_TOKEN не указан в переменных окружения")
 
 bot = telebot.TeleBot(bot_token)
+
+
+class FormStates(StatesGroup):
+    """Состояния для ConversationHandler формы анкетирования"""
+    ENTER_FULLNAME = State()
+    ENTER_BIRTHDAY = State()
 
 # Инициализация модуля работы с БД
 try:
@@ -45,9 +54,10 @@ def start_command(message):
 
 📋 Доступные команды:
 /start - показать это сообщение
-/form - заполнить анкету (в разработке)
+/form - заполнить анкету
+/help - справка по командам
 
-Для начала работы используйте команду /form
+🚀 Для начала работы используйте команду /form
         """
         
         bot.reply_to(message, welcome_text.strip())
@@ -58,33 +68,134 @@ def start_command(message):
         bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
 
 
+# ConversationHandler для формы анкетирования
 @bot.message_handler(commands=['form'])
 def form_command(message):
-    """Обработчик команды /form (заглушка)"""
+    """Обработчик команды /form - начало анкетирования"""
     try:
         user_id = message.from_user.id
         user_name = message.from_user.first_name
-        
-        form_text = """
-📋 Анкета пользователя
 
-Функция заполнения анкеты находится в разработке.
+        if not db:
+            bot.reply_to(message, "❌ Модуль работы с БД не инициализирован. Попробуйте позже.")
+            return
 
-В ближайшее время здесь будет доступна форма для ввода:
-• Полного имени
-• Суммы
-• Номера карты  
-• Даты рождения
+        # Начинаем диалог анкетирования
+        bot.reply_to(message, "📋 Заполнение анкеты\n\nВведите ваше ФИО:")
+        bot.set_state(message.from_user.id, FormStates.ENTER_FULLNAME, message.chat.id)
+        logger.info(f"Пользователь {user_id} ({user_name}) начал заполнение анкеты")
 
-Следите за обновлениями! 🚀
-        """
-        
-        bot.reply_to(message, form_text.strip())
-        logger.info(f"Пользователь {user_id} ({user_name}) запросил анкету")
-        
     except Exception as e:
         logger.error(f"Ошибка в обработчике /form: {e}")
         bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
+
+
+@bot.message_handler(state=FormStates.ENTER_FULLNAME)
+def handle_fullname(message):
+    """Обработчик ввода ФИО"""
+    try:
+        user_id = message.from_user.id
+        fullname = message.text.strip()
+
+        # Валидация ФИО - должно быть минимум 2 слова
+        if not fullname or len(fullname.split()) < 2:
+            bot.reply_to(message, "❌ ФИО должно содержать минимум 2 слова (имя и фамилия). Попробуйте снова:")
+            return
+
+        # Сохраняем ФИО в состоянии
+        with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+            data['fullname'] = fullname
+
+        bot.reply_to(message, "✅ ФИО принято!\n\nВведите вашу дату рождения в формате ДД.ММ.ГГГГ (например, 31.12.2000):")
+        bot.set_state(message.from_user.id, FormStates.ENTER_BIRTHDAY, message.chat.id)
+        logger.info(f"Пользователь {user_id} ввел ФИО: {fullname}")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике ввода ФИО: {e}")
+        bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
+        bot.delete_state(message.from_user.id, message.chat.id)
+
+
+@bot.message_handler(state=FormStates.ENTER_BIRTHDAY)
+def handle_birthday(message):
+    """Обработчик ввода даты рождения"""
+    try:
+        user_id = message.from_user.id
+        birthday_text = message.text.strip()
+
+        # Валидация формата даты (ДД.ММ.ГГГГ)
+        date_pattern = r'^(\d{2})\.(\d{2})\.(\d{4})$'
+        match = re.match(date_pattern, birthday_text)
+
+        if not match:
+            bot.reply_to(message, "❌ Неправильный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 31.12.2000):")
+            return
+
+        day, month, year = map(int, match.groups())
+
+        # Проверяем корректность даты
+        try:
+            birthday_date = datetime(year, month, day)
+        except ValueError:
+            bot.reply_to(message, "❌ Некорректная дата. Проверьте, что день и месяц существуют:")
+            return
+
+        # Проверяем, что дата не в будущем
+        if birthday_date > datetime.now():
+            bot.reply_to(message, "❌ Дата рождения не может быть в будущем. Введите корректную дату:")
+            return
+
+        # Получаем сохраненные данные
+        with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+            fullname = data.get('fullname')
+            if not fullname:
+                bot.reply_to(message, "❌ Ошибка данных. Начните заполнение анкеты заново командой /form")
+                bot.delete_state(message.from_user.id, message.chat.id)
+                return
+
+            # Генерируем следующий номер карты
+            card_number = db.get_next_card_number()
+            if card_number is None:
+                bot.reply_to(message, "❌ Ошибка генерации номера карты. Попробуйте позже.")
+                bot.delete_state(message.from_user.id, message.chat.id)
+                return
+
+            # Сохраняем данные в БД
+            birthday_str = birthday_date.strftime('%Y-%m-%d')
+            user_id_db = db.add_user(
+                full_name=fullname,
+                summ=0.0,
+                card_number=card_number,
+                birthday=birthday_str
+            )
+
+            if user_id_db is None:
+                bot.reply_to(message, "❌ Произошла техническая ошибка при сохранении данных. Попробуйте позже.")
+                logger.error(f"Не удалось сохранить пользователя {fullname} в БД")
+            else:
+                bot.reply_to(message, f"✅ Анкета успешно сохранена!\n\n📋 Ваш номер анкеты: {card_number}")
+                logger.info(f"Пользователь {user_id} успешно сохранил анкету с номером: {card_number}")
+
+        # Завершаем диалог
+        bot.delete_state(message.from_user.id, message.chat.id)
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике ввода даты рождения: {e}")
+        bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
+        bot.delete_state(message.from_user.id, message.chat.id)
+
+
+@bot.message_handler(commands=['cancel'], state=[FormStates.ENTER_FULLNAME, FormStates.ENTER_BIRTHDAY])
+def cancel_form(message):
+    """Обработчик отмены заполнения анкеты"""
+    try:
+        user_id = message.from_user.id
+        bot.reply_to(message, "❌ Заполнение анкеты отменено.")
+        bot.delete_state(message.from_user.id, message.chat.id)
+        logger.info(f"Пользователь {user_id} отменил заполнение анкеты")
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике отмены: {e}")
+        bot.reply_to(message, "Произошла ошибка.")
 
 
 @bot.message_handler(commands=['status'])
@@ -118,18 +229,28 @@ def help_command(message):
         help_text = """
 📚 Справка по командам бота:
 
+🚀 Основные команды:
 /start - Запуск бота и приветствие
-/form - Заполнение анкеты (в разработке)
+/form - Заполнение анкеты пользователя
 /status - Проверка состояния подключения к БД
 /help - Показать эту справку
+
+⚙️ Дополнительные команды:
+/cancel - Отменить заполнение анкеты (во время заполнения)
+
+📋 Как заполнить анкету:
+1. Введите /form
+2. Укажите ваше ФИО (минимум 2 слова)
+3. Укажите дату рождения в формате ДД.ММ.ГГГГ
+4. Получите ваш уникальный номер анкеты
 
 🔧 Техническая поддержка:
 Если возникли проблемы, обратитесь к администратору.
         """
-        
+
         bot.reply_to(message, help_text.strip())
         logger.info(f"Пользователь {message.from_user.id} запросил справку")
-        
+
     except Exception as e:
         logger.error(f"Ошибка в обработчике /help: {e}")
         bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
@@ -167,7 +288,7 @@ def check_database_connection():
     if not db:
         logger.error("Модуль БД не инициализирован")
         return False
-    
+
     try:
         if db.test_connection():
             logger.info("✅ Соединение с БД успешно установлено")
@@ -178,6 +299,13 @@ def check_database_connection():
     except Exception as e:
         logger.error(f"❌ Ошибка при проверке соединения с БД: {e}")
         return False
+
+
+# Регистрация состояний для ConversationHandler
+from telebot.custom_filters import StateFilter
+
+# Добавляем фильтр состояний
+bot.add_custom_filter(StateFilter(bot))
 
 
 def main():
