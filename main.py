@@ -8,6 +8,7 @@ from telebot import types
 from telebot.handler_backends import State, StatesGroup
 from database import Database
 from excel_manager import get_excel_manager
+from sqlite_manager import get_sqlite_manager
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -48,6 +49,9 @@ except Exception as e:
     logger.error(f"Ошибка инициализации модуля Excel: {e}")
     excel_manager = None
 
+# SQLite менеджер будет создаваться по требованию для каждого запроса
+# Это обеспечивает потокобезопасность
+
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -85,9 +89,8 @@ def form_command(message):
         user_id = message.from_user.id
         user_name = message.from_user.first_name
 
-        if not db:
-            bot.reply_to(message, "❌ Модуль работы с БД не инициализирован. Попробуйте позже.")
-            return
+        # Создаем локальный экземпляр SQLite менеджера для проверки
+        sqlite_manager = get_sqlite_manager()
 
         # Начинаем диалог анкетирования
         bot.reply_to(message, "📋 Заполнение анкеты\n\nВведите ваше ФИО:")
@@ -132,6 +135,9 @@ def handle_birthday(message):
         user_id = message.from_user.id
         birthday_text = message.text.strip()
 
+        # Создаем локальный экземпляр SQLite менеджера
+        sqlite_manager = get_sqlite_manager()
+
         # Валидация формата даты (ДД.ММ.ГГГГ)
         date_pattern = r'^(\d{2})\.(\d{2})\.(\d{4})$'
         match = re.match(date_pattern, birthday_text)
@@ -162,49 +168,28 @@ def handle_birthday(message):
                 bot.delete_state(message.from_user.id, message.chat.id)
                 return
 
-            # Генерируем следующий номер карты
-            card_number = db.get_next_card_number()
-            if card_number is None:
-                bot.reply_to(message, "❌ Ошибка генерации номера карты. Попробуйте позже.")
-                bot.delete_state(message.from_user.id, message.chat.id)
-                return
+            # Генерируем следующий номер карты на основе существующих в SQLite
+            all_users = sqlite_manager.get_all_users()
+            existing_card_numbers = {user['card_number'] for user in all_users if user['card_number']}
+            card_number = max(existing_card_numbers) + 1 if existing_card_numbers else 1
 
-            # Сохраняем данные в БД
+            # Сохраняем данные только в SQLite
             birthday_str = birthday_date.strftime('%Y-%m-%d')
-            user_id_db = db.add_user(
-                full_name=fullname,
-                summ=0.0,
-                card_number=card_number,
-                birthday=birthday_str
-            )
+            user_data = {
+                "full_name": fullname,
+                "summ": 0.0,
+                "card_number": card_number,
+                "birthday": birthday_str
+            }
+
+            user_id_db = sqlite_manager.add_user(user_data)
 
             if user_id_db is None:
                 bot.reply_to(message, "❌ Произошла техническая ошибка при сохранении данных. Попробуйте позже.")
-                logger.error(f"Не удалось сохранить пользователя {fullname} в БД")
+                logger.error(f"Не удалось сохранить пользователя {fullname} в SQLite")
             else:
-                # Создаем резервную копию в Excel
-                user_data_for_backup = {
-                    "id": user_id_db,
-                    "full_name": fullname,
-                    "summ": 0.0,
-                    "card_number": card_number,
-                    "birthday": birthday_str
-                }
-
-                if excel_manager:
-                    try:
-                        if excel_manager.add_user(user_data_for_backup):
-                            logger.info(f"Резервная копия пользователя {fullname} успешно создана в Excel")
-                        else:
-                            logger.warning(f"Не удалось создать резервную копию пользователя {fullname} в Excel")
-                    except Exception as e:
-                        logger.error(f"Ошибка при создании резервной копии в Excel: {e}")
-                        # Не прерываем работу бота из-за ошибки Excel
-                else:
-                    logger.warning("Модуль Excel не инициализирован - резервная копия не создана")
-
-                bot.reply_to(message, f"✅ Анкета успешно сохранена!\n\n📋 Ваш номер анкеты: {card_number}")
-                logger.info(f"Пользователь {user_id} успешно сохранил анкету с номером: {card_number}")
+                bot.reply_to(message, f"✅ Данные сохранены локально!\n\n📋 Ваш номер анкеты: {card_number}\n\n💡 Для синхронизации с облаком используйте /sync_pg")
+                logger.info(f"Пользователь {user_id} успешно сохранил анкету в SQLite с номером: {card_number}")
 
         # Завершаем диалог
         bot.delete_state(message.from_user.id, message.chat.id)
@@ -252,6 +237,40 @@ def status_command(message):
         bot.reply_to(message, "Произошла ошибка при проверке статуса.")
 
 
+@bot.message_handler(commands=['stats'])
+def stats_command(message):
+    """Обработчик команды /stats - статистика синхронизации"""
+    try:
+        user_id = message.from_user.id
+
+        # Создаем локальный экземпляр SQLite менеджера
+        sqlite_manager = get_sqlite_manager()
+
+        # Получаем статистику синхронизации
+        sync_stats = sqlite_manager.get_sync_stats()
+
+        info_text = f"""
+📊 Статистика синхронизации:
+
+🗄️ Основное хранилище (SQLite):
+👥 Всего пользователей: {sync_stats['total_users']}
+✅ Синхронизировано: {sync_stats['synced_users']}
+⏳ Ожидают синхронизации: {sync_stats['unsynced_users']}
+📈 Процент синхронизации: {sync_stats['sync_percentage']}%
+
+🌐 Статус подключений:
+PostgreSQL: {"✅ Подключен" if db else "❌ Отключен"}
+Excel: {"✅ Подключен" if excel_manager else "❌ Отключен"}
+        """
+
+        bot.reply_to(message, info_text.strip())
+        logger.info(f"Пользователь {user_id} запросил статистику синхронизации")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике /stats: {e}")
+        bot.reply_to(message, "Произошла ошибка при получении статистики.")
+
+
 @bot.message_handler(commands=['backup'])
 def backup_command(message):
     """Обработчик команды /backup - информация о резервной копии"""
@@ -293,6 +312,154 @@ def backup_command(message):
     except Exception as e:
         logger.error(f"Ошибка в обработчике /backup: {e}")
         bot.reply_to(message, "Произошла ошибка при получении информации о резервной копии.")
+
+
+@bot.message_handler(commands=['sync_pg'])
+def sync_pg_command(message):
+    """Обработчик команды /sync_pg - синхронизация с PostgreSQL"""
+    try:
+        user_id = message.from_user.id
+
+        # Создаем локальный экземпляр SQLite менеджера
+        sqlite_manager = get_sqlite_manager()
+
+        if not db:
+            bot.reply_to(message, "❌ Модуль работы с PostgreSQL не инициализирован")
+            return
+
+        # Получаем несинхронизированных пользователей
+        unsynced_users = sqlite_manager.get_unsynced_users()
+
+        if not unsynced_users:
+            bot.reply_to(message, "ℹ️ Все данные уже синхронизированы с PostgreSQL")
+            return
+
+        # Синхронизируем пользователей с PostgreSQL
+        success_count = 0
+        error_count = 0
+        synced_ids = []
+
+        bot.reply_to(message, f"🔄 Начинаю синхронизацию {len(unsynced_users)} записей с PostgreSQL...")
+
+        for user in unsynced_users:
+            try:
+                # Преобразуем данные для PostgreSQL
+                pg_user_data = {
+                    "full_name": user["full_name"],
+                    "summ": user["summ"],
+                    "card_number": user["card_number"],
+                    "birthday": user["birthday"]
+                }
+
+                # Добавляем в PostgreSQL
+                pg_user_id = db.add_user(**pg_user_data)
+
+                if pg_user_id is not None:
+                    success_count += 1
+                    synced_ids.append(user["id"])
+                    logger.info(f"Пользователь {user['full_name']} (ID: {user['id']}) синхронизирован с PostgreSQL")
+                else:
+                    error_count += 1
+                    logger.error(f"Не удалось синхронизировать пользователя {user['full_name']} (ID: {user['id']}) с PostgreSQL")
+
+            except Exception as e:
+                error_count += 1
+                logger.error(f"Ошибка синхронизации пользователя {user['full_name']} (ID: {user['id']}): {e}")
+
+        # Отмечаем успешно синхронизированных пользователей в SQLite
+        if synced_ids:
+            if sqlite_manager.mark_users_synced(synced_ids):
+                logger.info(f"Отмечено {len(synced_ids)} пользователей как синхронизированные")
+            else:
+                logger.error("Не удалось отметить пользователей как синхронизированные")
+
+        # Формируем отчет
+        total_processed = success_count + error_count
+        report_text = f"""
+🔄 Синхронизация с PostgreSQL завершена:
+
+✅ Успешно синхронизировано: {success_count} записей
+❌ Ошибок синхронизации: {error_count} записей
+📊 Всего обработано: {total_processed} записей
+
+📈 Статус: {len(unsynced_users) - success_count} записей ожидают повторной синхронизации
+        """
+
+        bot.reply_to(message, report_text.strip())
+        logger.info(f"Пользователь {user_id} выполнил синхронизацию с PostgreSQL: {success_count}/{total_processed} успешно")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике /sync_pg: {e}")
+        bot.reply_to(message, "Произошла ошибка при синхронизации с PostgreSQL. Попробуйте позже.")
+
+
+@bot.message_handler(commands=['sync_excel'])
+def sync_excel_command(message):
+    """Обработчик команды /sync_excel - синхронизация с Excel"""
+    try:
+        user_id = message.from_user.id
+
+        # Создаем локальный экземпляр SQLite менеджера
+        sqlite_manager = get_sqlite_manager()
+
+        if not excel_manager:
+            bot.reply_to(message, "❌ Модуль Excel не инициализирован")
+            return
+
+        # Получаем все данные из SQLite
+        all_users = sqlite_manager.get_all_users()
+
+        if not all_users:
+            bot.reply_to(message, "ℹ️ В базе данных нет данных для синхронизации")
+            return
+
+        # Очищаем Excel файл
+        if not excel_manager.clear_backup():
+            bot.reply_to(message, "❌ Ошибка при очистке Excel файла")
+            return
+
+        # Добавляем все данные в Excel
+        success_count = 0
+        error_count = 0
+
+        for user in all_users:
+            try:
+                # Преобразуем данные для Excel
+                excel_user_data = {
+                    "id": user["id"],
+                    "full_name": user["full_name"],
+                    "summ": user["summ"],
+                    "card_number": user["card_number"],
+                    "birthday": user["birthday"]
+                }
+
+                if excel_manager.add_user(excel_user_data):
+                    success_count += 1
+                else:
+                    error_count += 1
+
+            except Exception as e:
+                error_count += 1
+                logger.error(f"Ошибка синхронизации пользователя {user['full_name']} (ID: {user['id']}) с Excel: {e}")
+
+        # Формируем отчет
+        total_processed = success_count + error_count
+        report_text = f"""
+🔄 Синхронизация с Excel завершена:
+
+✅ Успешно синхронизировано: {success_count} записей
+❌ Ошибок синхронизации: {error_count} записей
+📊 Всего обработано: {total_processed} записей
+
+📁 Excel-файл обновлен: {excel_manager.file_path}
+        """
+
+        bot.reply_to(message, report_text.strip())
+        logger.info(f"Пользователь {user_id} выполнил синхронизацию с Excel: {success_count}/{total_processed} успешно")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике /sync_excel: {e}")
+        bot.reply_to(message, "Произошла ошибка при синхронизации с Excel. Попробуйте позже.")
 
 
 @bot.message_handler(commands=['clear_backup'])
@@ -425,19 +592,31 @@ def help_command(message):
 /status - Проверка состояния подключения к БД
 /help - Показать эту справку
 
+🗄️ Команды основного хранилища:
+/stats - Статистика синхронизации и состояния хранилищ
+
+🔄 Команды синхронизации:
+/sync_pg - Синхронизировать несинхронизированные данные с PostgreSQL
+/sync_excel - Обновить Excel файл всеми данными из SQLite
+
 ⚙️ Команды резервного копирования:
 /backup - Информация о резервной копии в Excel
-/sync_backup - Синхронизировать новые данные из БД в Excel
 /clear_backup - Очистить резервную копию в Excel
 
 ⚙️ Дополнительные команды:
 /cancel - Отменить заполнение анкеты (во время заполнения)
 
+📋 Архитектура хранения данных:
+1️⃣ SQLite (database.db) - основное локальное хранилище
+2️⃣ PostgreSQL (облако) - синхронизированная копия
+3️⃣ Excel (backup.xlsx) - резервная копия
+
 📋 Как заполнить анкету:
 1. Введите /form
 2. Укажите ваше ФИО (минимум 2 слова)
 3. Укажите дату рождения в формате ДД.ММ.ГГГГ
-4. Получите ваш уникальный номер анкеты
+4. Данные сохранятся локально в SQLite
+5. Используйте /sync_pg для синхронизации с облаком
 
 🔧 Техническая поддержка:
 Если возникли проблемы, обратитесь к администратору.
