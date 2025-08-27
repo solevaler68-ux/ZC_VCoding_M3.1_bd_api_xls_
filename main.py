@@ -7,6 +7,7 @@ import telebot
 from telebot import types
 from telebot.handler_backends import State, StatesGroup
 from database import Database
+from excel_manager import get_excel_manager
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -38,6 +39,14 @@ try:
 except Exception as e:
     logger.error(f"Ошибка инициализации модуля БД: {e}")
     db = None
+
+# Инициализация модуля резервного копирования в Excel
+try:
+    excel_manager = get_excel_manager()
+    logger.info("Модуль резервного копирования Excel инициализирован")
+except Exception as e:
+    logger.error(f"Ошибка инициализации модуля Excel: {e}")
+    excel_manager = None
 
 
 @bot.message_handler(commands=['start'])
@@ -173,6 +182,27 @@ def handle_birthday(message):
                 bot.reply_to(message, "❌ Произошла техническая ошибка при сохранении данных. Попробуйте позже.")
                 logger.error(f"Не удалось сохранить пользователя {fullname} в БД")
             else:
+                # Создаем резервную копию в Excel
+                user_data_for_backup = {
+                    "id": user_id_db,
+                    "full_name": fullname,
+                    "summ": 0.0,
+                    "card_number": card_number,
+                    "birthday": birthday_str
+                }
+
+                if excel_manager:
+                    try:
+                        if excel_manager.add_user(user_data_for_backup):
+                            logger.info(f"Резервная копия пользователя {fullname} успешно создана в Excel")
+                        else:
+                            logger.warning(f"Не удалось создать резервную копию пользователя {fullname} в Excel")
+                    except Exception as e:
+                        logger.error(f"Ошибка при создании резервной копии в Excel: {e}")
+                        # Не прерываем работу бота из-за ошибки Excel
+                else:
+                    logger.warning("Модуль Excel не инициализирован - резервная копия не создана")
+
                 bot.reply_to(message, f"✅ Анкета успешно сохранена!\n\n📋 Ваш номер анкеты: {card_number}")
                 logger.info(f"Пользователь {user_id} успешно сохранил анкету с номером: {card_number}")
 
@@ -222,6 +252,166 @@ def status_command(message):
         bot.reply_to(message, "Произошла ошибка при проверке статуса.")
 
 
+@bot.message_handler(commands=['backup'])
+def backup_command(message):
+    """Обработчик команды /backup - информация о резервной копии"""
+    try:
+        user_id = message.from_user.id
+
+        if not excel_manager:
+            bot.reply_to(message, "❌ Модуль резервного копирования не инициализирован")
+            return
+
+        # Получаем информацию о резервной копии
+        backup_info = excel_manager.get_backup_info()
+
+        if "error" in backup_info:
+            bot.reply_to(message, f"❌ Ошибка получения информации о резервной копии: {backup_info['error']}")
+            return
+
+        # Формируем сообщение с информацией
+        info_text = f"""
+📊 Информация о резервной копии:
+
+📁 Файл: {backup_info['file_path']}
+📈 Существует: {"✅ Да" if backup_info['file_exists'] else "❌ Нет"}
+📏 Размер: {backup_info['file_size']} байт
+👥 Всего записей: {backup_info['total_records']}
+
+🔄 Автоматическое резервное копирование: {"✅ Активно" if excel_manager else "❌ Отключено"}
+        """
+
+        # Добавляем информацию о последнем изменении если файл существует
+        if backup_info['last_modified']:
+            from datetime import datetime
+            last_modified_str = datetime.fromtimestamp(backup_info['last_modified']).strftime('%Y-%m-%d %H:%M:%S')
+            info_text += f"🕒 Последнее изменение: {last_modified_str}"
+
+        bot.reply_to(message, info_text.strip())
+        logger.info(f"Пользователь {user_id} запросил информацию о резервной копии")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике /backup: {e}")
+        bot.reply_to(message, "Произошла ошибка при получении информации о резервной копии.")
+
+
+@bot.message_handler(commands=['clear_backup'])
+def clear_backup_command(message):
+    """Обработчик команды /clear_backup - очистка резервной копии"""
+    try:
+        user_id = message.from_user.id
+
+        if not excel_manager:
+            bot.reply_to(message, "❌ Модуль резервного копирования не инициализирован")
+            return
+
+        # Получаем информацию о текущем состоянии
+        backup_info = excel_manager.get_backup_info()
+        current_records = backup_info.get("total_records", 0)
+
+        if current_records == 0:
+            bot.reply_to(message, "ℹ️ Резервная копия уже пуста")
+            return
+
+        # Очищаем резервную копию
+        if excel_manager.clear_backup():
+            bot.reply_to(message, f"✅ Резервная копия очищена!\n\n🗑️ Удалено записей: {current_records}")
+            logger.info(f"Пользователь {user_id} очистил резервную копию ({current_records} записей)")
+        else:
+            bot.reply_to(message, "❌ Ошибка при очистке резервной копии")
+            logger.error(f"Не удалось очистить резервную копию для пользователя {user_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике /clear_backup: {e}")
+        bot.reply_to(message, "Произошла ошибка при очистке резервной копии.")
+
+
+@bot.message_handler(commands=['sync_backup'])
+def sync_backup_command(message):
+    """Обработчик команды /sync_backup - синхронизация всех данных из БД в Excel"""
+    try:
+        user_id = message.from_user.id
+
+        if not db:
+            bot.reply_to(message, "❌ Модуль работы с БД не инициализирован")
+            return
+
+        if not excel_manager:
+            bot.reply_to(message, "❌ Модуль резервного копирования не инициализирован")
+            return
+
+        # Получаем всех пользователей из БД
+        all_users = db.get_all_users()
+
+        if not all_users:
+            bot.reply_to(message, "ℹ️ В базе данных нет пользователей для резервного копирования")
+            return
+
+        # Получаем существующие ID из Excel файла
+        existing_ids = excel_manager.get_existing_ids()
+        logger.info(f"Найдено {len(existing_ids)} существующих записей в Excel файле")
+
+        # Фильтруем только новые записи
+        new_users = []
+        skipped_users = 0
+
+        for user in all_users:
+            user_id_db = user["id"]
+            if user_id_db in existing_ids:
+                skipped_users += 1
+                logger.debug(f"Запись пользователя ID {user_id_db} уже существует в Excel, пропускаем")
+            else:
+                new_users.append(user)
+
+        if not new_users:
+            bot.reply_to(message, f"ℹ️ Все записи из базы данных уже существуют в резервной копии!\n\n📊 Всего в БД: {len(all_users)}\n📁 Уже в Excel: {len(existing_ids)}\n⏭️ Пропущено: {skipped_users}")
+            return
+
+        # Синхронизируем только новые данные в Excel
+        success_count = 0
+        error_count = 0
+
+        for user in new_users:
+            try:
+                # Преобразуем данные в нужный формат
+                user_data = {
+                    "id": user["id"],
+                    "full_name": user["full_name"],
+                    "summ": user["summ"],
+                    "card_number": user["card_number"],
+                    "birthday": user["birthday"].strftime('%Y-%m-%d') if hasattr(user["birthday"], 'strftime') else str(user["birthday"])
+                }
+
+                if excel_manager.add_user(user_data):
+                    success_count += 1
+                else:
+                    error_count += 1
+            except Exception as e:
+                logger.error(f"Ошибка синхронизации пользователя {user.get('full_name', 'Unknown')}: {e}")
+                error_count += 1
+
+        # Формируем отчет
+        total_processed = success_count + error_count
+        report_text = f"""
+🔄 Синхронизация завершена:
+
+✅ Новых записей добавлено: {success_count}
+❌ Ошибок при добавлении: {error_count}
+⏭️ Пропущено (уже существуют): {skipped_users}
+📊 Всего обработано: {total_processed}
+
+📁 Резервная копия обновлена в файле: {excel_manager.file_path}
+📈 Теперь в Excel: {len(existing_ids) + success_count} записей
+        """
+
+        bot.reply_to(message, report_text.strip())
+        logger.info(f"Пользователь {user_id} выполнил синхронизацию резервной копии: добавлено {success_count}, пропущено {skipped_users}")
+
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике /sync_backup: {e}")
+        bot.reply_to(message, "Произошла ошибка при синхронизации резервной копии.")
+
+
 @bot.message_handler(commands=['help'])
 def help_command(message):
     """Обработчик команды /help"""
@@ -234,6 +424,11 @@ def help_command(message):
 /form - Заполнение анкеты пользователя
 /status - Проверка состояния подключения к БД
 /help - Показать эту справку
+
+⚙️ Команды резервного копирования:
+/backup - Информация о резервной копии в Excel
+/sync_backup - Синхронизировать новые данные из БД в Excel
+/clear_backup - Очистить резервную копию в Excel
 
 ⚙️ Дополнительные команды:
 /cancel - Отменить заполнение анкеты (во время заполнения)
@@ -312,22 +507,30 @@ def main():
     """Основная функция запуска бота"""
     try:
         logger.info("🚀 Запуск телеграм-бота...")
-        
+
         # Проверка соединения с БД
         if not check_database_connection():
             logger.warning("⚠️ Бот запускается без подключения к БД")
-        
+
         # Запуск бота
         logger.info("🤖 Бот запущен и готов к работе")
         logger.info("📱 Используйте Ctrl+C для остановки")
-        
+
         bot.polling(none_stop=True, interval=0)
-        
+
     except KeyboardInterrupt:
         logger.info("🛑 Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"❌ Критическая ошибка: {e}")
     finally:
+        # Корректное завершение работы модулей
+        if excel_manager:
+            try:
+                excel_manager.close()
+                logger.info("Модуль Excel корректно завершен")
+            except Exception as e:
+                logger.error(f"Ошибка при завершении модуля Excel: {e}")
+
         logger.info("👋 Бот завершил работу")
 
 
